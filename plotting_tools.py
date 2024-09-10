@@ -139,8 +139,11 @@ class SurplusPlotter:
         sns.set_style('ticks')
         fig = plt.figure()
         ax = plt.gca()
-        for option, data in self.surplus_diff.items():
-            sns.boxplot(y=data, ax=ax)
+        values = [v for v in self.surplus_diff.values()]
+        xtick_labels = [k for k in self.surplus_diff.keys()]
+        bplot = ax.boxplot(values, patch_artist=True, labels=xtick_labels)
+        # for option, data in self.surplus_diff.items():
+        #     sns.boxplot(y=data, ax=ax)
         os.makedirs('figs', exist_ok=True)
         plt.savefig('figs/surplus_bw.png', bbox_inches='tight')
         if show:
@@ -154,6 +157,8 @@ class RevenuePlotter:
         self.dirlist = dirlist
         self.si = str_to_pd_resample(sample_interval)
         self.products = ['EN', 'RGU', 'RGD', 'SPR', 'NSP', 'DEG']
+        self.scale = 1000 # Scaling on dollars
+        assert self.scale in [1, 1000]
         # Create/load profit summary spreadsheets
         self.get_profit_summary(new_profits=new_profits)
 
@@ -187,7 +192,8 @@ class RevenuePlotter:
         tunit = 'day'
         times = None
         for directory in self.dirlist:
-            key = '_'.join(directory.split('_')[1:])  # converts bbm_option_N -> option_N
+            dbase = os.path.basename(directory)
+            key = '_'.join(dbase.split('_')[1:])  # converts bbm_option_N -> option_N
             product_profits[key] = dict()
             for product in self.products:
                 for pid in pids:
@@ -217,11 +223,63 @@ class RevenuePlotter:
                         product_profits[key][product] = prod_vals
         self.save_summary(product_profits, times)
 
+    def get_median_err(self, values, low, high, dec=1):
+        """ Computes the median and low/high error """
+        median = np.median(values)
+        # Compute low/high values. Convert to difference from median for saving
+        value_sort = np.sort(values)
+        low_range = value_sort[int(low / 100 * len(value_sort))]
+        high_range = value_sort[int(high / 100 * len(value_sort))]
+        low_err = median - low_range
+        high_err = high_range - median
+        scale = self.scale
+        median = round(median/scale, dec)
+        low_err = round(low_err/scale, dec)
+        high_err = round(high_err/scale, dec)
+        stat_dict = {'median':median, 'low_err':low_err, 'high_err':high_err}
+        return stat_dict
+
+    def calc_summary_stats(self, low=16, high=84):
+        """ Computes median and low/high bounds for each of income, deg, and net """
+        self.ps_stats = {'income':{}, 'degradation':{}, 'net':{}}
+        for key in self.ps_stats.keys():
+            if key == 'net':
+                cols = self.ps['income'].columns
+                for col in cols:
+                    if col == 'time':
+                        continue
+                    values = self.ps['income'][col].values + self.ps['degradation'][col].values
+                    stat_dict = self.get_median_err(values, low, high)
+                    self.ps_stats[key][col] = stat_dict
+            else:
+                cols = self.ps[key].columns
+                for col in cols:
+                    if col == 'time':
+                        continue
+                    values = self.ps[key][col].values
+                    stat_dict = self.get_median_err(values, low, high)
+                    self.ps_stats[key][col] = stat_dict
+
     def get_profit_summary(self, new_profits=False):
         """ Checks for or creates profit summary and loads """
         if not os.path.exists('daily_profit_summary.xlsx') or new_profits:
             self.create_profit_summary()
         self.ps = pd.read_excel('daily_profit_summary.xlsx', sheet_name=None)
+        self.calc_summary_stats()
+
+    def add_stat_text(self, ax, mode, labels, incl_errs=False):
+        """ Adds the stat summaries to the plot """
+        xvals = ax.get_xticks()
+        ylims = ax.get_ylim()
+        yval = ylims[0] + 0.1*(ylims[1] - ylims[0])
+        for i, xval in enumerate(xvals):
+            # Load the relevant stat dict (e.g., mode = 'income', labels[i] = 'baseline')
+            stat_dict = self.ps_stats[mode][labels[i]]
+            if incl_errs:
+                stat_text = f'{stat_dict["median"]}k$^{{{stat_dict["high_err"]}}}_{{-{stat_dict["low_err"]}}}$'
+            else:
+                stat_text = f'${stat_dict["median"]}k'
+            ax.text(xval, yval, stat_text, ha='center', va='center', fontsize=12)
 
     def make_boxplot(self, data, mode, show=False):
         """ Creates and styles boxplots """
@@ -230,16 +288,25 @@ class RevenuePlotter:
         sns.set_style('ticks')
         # Make figure and add each column to the plot
         fig, ax = plt.subplots()
-        values = [data.values[:,i] for i in range(data.values.shape[1]) if i != 0]
+        values = [data.values[:,i]/self.scale for i in range(data.values.shape[1]) if i != 0]
         labels = data.columns[1:]
-        bplot = ax.boxplot(values, patch_artist=True, labels=labels)
+        xtick_labels = [' '.join(l.split('_')).capitalize() for l in labels] # Remove underscore, capitalize
+        bplot = ax.boxplot(values, patch_artist=True, labels=xtick_labels)
         # Colors
         for patch, color, in zip(bplot['boxes'], sns.color_palette('hls', len(labels))):
             patch.set_facecolor(color)
         ax.set_ylabel('Dollars ($)', fontsize=14)
+        if self.scale == 1000:
+            # Add 'k' to the tick label (thousands of dollars)
+            yticklabels = ax.get_yticklabels()
+            for ytick in yticklabels:
+                ytick.set_text(f'{ytick.get_text()}k')
+            ax.set_yticklabels(yticklabels)
+        self.add_stat_text(ax, mode, labels)
         os.makedirs('figs', exist_ok=True)
         plt.savefig(f'figs/profit_{mode}.png', bbox_inches='tight')
         if show:
+            plt.title(f"Average Daily {mode.capitalize()}")
             plt.show()
         plt.close(fig)
 
@@ -262,8 +329,9 @@ if __name__ == '__main__':
     dirs = sorted(dirs)
     # Convert to absolute paths
     dirs = [os.path.abspath(d) for d in dirs]
-    dirs = ['../scenarios/bbm_baseline', '../scenarios/bbm_option_3']
+    # dirs = ['../scenarios/bbm_baseline', '../scenarios/bbm_option_2', '../scenarios/bbm_option_3',
+    #         '../scenarios/bbm_option_5']
     splotter = SurplusPlotter(dirs, sample_interval='day', stype='surplus_minus_str')
-    # splotter.plot_differences()
+    splotter.plot_differences(show=True)
     rplotter = RevenuePlotter(dirs, new_profits=True)
     rplotter.plot_profits(show=True)
