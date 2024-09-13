@@ -49,7 +49,7 @@ def group_by_day(times, values):
 class SurplusPlotter:
     
     def __init__(self, dirlist, mkt_fname='market_summary_TSRTM.csv', sample_interval='day',
-                 stype='surplus_phys'):
+                 stype='surplus_phys', mode='percent'):
         """ Initialize with a list of saved directories to use for plotting
         Each directory may contain several market surplus files
         Requires the same files in each directory
@@ -64,6 +64,8 @@ class SurplusPlotter:
         self.dirlist = dirlist
         self.mkt_fname = mkt_fname
         self.si = str_to_pd_resample(sample_interval)
+        assert mode in ['percent', 'absolute']
+        self.mode = mode
         # None defaults for class attributes
         self.surplus_types = None
         self.timeseries = None
@@ -71,7 +73,12 @@ class SurplusPlotter:
         self.option_surplus = None
         self.surplus_diff = None
         # Load data
+        if self.mode == 'percent':
+            self.scale = 1
+        else:
+            self.scale = 1000
         self.get_differences()
+        self.os_stats = self.get_median_err()
         
     def find_surplus_types(self, firstdir):
         """ Checks for the different surplus types and loads them into a list """
@@ -103,7 +110,8 @@ class SurplusPlotter:
         self.option_surplus = dict()
         for directory in self.dirlist:
             if 'option' in directory:
-                key = '_'.join(directory.split('_')[1:])  # converts bbm_option_N -> option_N
+                bname = os.path.basename(directory)
+                key = '_'.join(bname.split('_')[1:])  # converts bbm_option_N -> option_N
 
                 df = pd.read_csv(os.path.join(directory, self.mkt_fname), index_col='time')
                 df.index = pd.to_datetime(df.index, format='%Y%m%d%H%M')
@@ -119,6 +127,25 @@ class SurplusPlotter:
                         self.option_surplus[key] = self.option_surplus[key][:len(deg_cost)]
                     self.option_surplus[key] += deg_cost
 
+    def get_median_err(self, low=16, high=84, dec=2):
+        """ Computes the median and low/high error """
+        os_stats = {}
+        for key, values in self.surplus_diff.items():
+            median = np.median(values)
+            # Compute low/high values. Convert to difference from median for saving
+            value_sort = np.sort(values)
+            low_range = value_sort[int(low / 100 * len(value_sort))]
+            high_range = value_sort[int(high / 100 * len(value_sort))]
+            low_err = median - low_range
+            high_err = high_range - median
+            scale = self.scale
+            median = round(median/scale, dec)
+            low_err = round(low_err/scale, dec)
+            high_err = round(high_err/scale, dec)
+            stat_dict = {'median':median, 'low_err':low_err, 'high_err':high_err}
+            os_stats[key] = stat_dict
+        return os_stats
+
     def get_differences(self):
         """ Loads baseline and options and makes a dictionary of the differences """
         # First load baseline and options surplus
@@ -127,7 +154,28 @@ class SurplusPlotter:
         # Now compute differences
         self.surplus_diff = dict()
         for key, opt_surplus in self.option_surplus.items():
-            self.surplus_diff[key] = (opt_surplus - self.baseline_surplus)/self.baseline_surplus * 100
+            if self.mode == 'percent':
+                self.surplus_diff[key] = (opt_surplus - self.baseline_surplus)/self.baseline_surplus * 100
+            elif self.mode == 'absolute':
+                self.surplus_diff[key] = (opt_surplus - self.baseline_surplus)/self.scale
+
+    def add_stat_text(self, ax, labels, incl_errs=False):
+        """ Adds the stat summaries to the plot """
+        xvals = ax.get_xticks()
+        ylims = ax.get_ylim()
+        yval = ylims[1] - 0.05*(ylims[1] - ylims[0])
+        if self.mode == 'percent':
+            unit, extra = '%', ''
+        elif self.mode == 'absolute':
+            unit, extra = 'k', '$'
+        for i, xval in enumerate(xvals):
+            # Load the relevant stat dict (e.g., mode = 'income', labels[i] = 'baseline')
+            stat_dict = self.os_stats[labels[i]]
+            if incl_errs:
+                stat_text = f'{extra}{stat_dict["median"]}{unit}$^{{{stat_dict["high_err"]}}}_{{-{stat_dict["low_err"]}}}$'
+            else:
+                stat_text = f'{extra}{stat_dict["median"]}{unit}'
+            ax.text(xval, yval, stat_text, ha='center', va='center', fontsize=12)
 
     def plot_differences(self, show=False):
         """ Creates a box and whisker plot of the surplus differences"""
@@ -137,15 +185,28 @@ class SurplusPlotter:
         # Configure styles
         sns.set_style('whitegrid')
         sns.set_style('ticks')
-        fig = plt.figure()
-        ax = plt.gca()
+        fig, ax = plt.subplots()
         values = [v for v in self.surplus_diff.values()]
-        xtick_labels = [k for k in self.surplus_diff.keys()]
+        xtick_labels = [' '.join(k.split('_')).capitalize() for k in self.surplus_diff.keys()]
         bplot = ax.boxplot(values, patch_artist=True, labels=xtick_labels)
-        # for option, data in self.surplus_diff.items():
-        #     sns.boxplot(y=data, ax=ax)
+        # Colors
+        for patch, color, in zip(bplot['boxes'], sns.color_palette('hls', len(xtick_labels))):
+            patch.set_facecolor(color)
+        if self.mode == 'percent':
+            ylabel = 'Percentage (%)'
+        elif self.mode == 'absolute':
+            ylabel = 'Thousand Dollars ($)'
+        ax.set_ylabel(ylabel, fontsize=14)
+        plt.ylim(-0.5, 0.1)
+        if self.scale == 1000:
+            # Add 'k' to the tick label (thousands of dollars)
+            yticklabels = ax.get_yticklabels()
+            for ytick in yticklabels:
+                ytick.set_text(f'{ytick.get_text()}k')
+            ax.set_yticklabels(yticklabels)
+        self.add_stat_text(ax, list(self.surplus_diff.keys()))
         os.makedirs('figs', exist_ok=True)
-        plt.savefig('figs/surplus_bw.png', bbox_inches='tight')
+        plt.savefig(f'figs/surplus_bw_{self.mode}.png', bbox_inches='tight')
         if show:
             plt.show()
         plt.close(fig)
@@ -164,14 +225,14 @@ class RevenuePlotter:
 
     def save_summary(self, save_dict, save_times):
         """ Saves the profit summary to an excel file """
-        prods = ['income', 'degradation']
+        prods = ['revenue', 'degradation']
         data = np.zeros((len(save_times), len(save_dict) + 1), dtype=object)
         data[:, 0] = save_times
         dcols = ['time'] + list(save_dict.keys())
         with pd.ExcelWriter(f'daily_profit_summary.xlsx') as writer:
             for prod in prods:
                 for i, mkt in enumerate(save_dict.keys()):
-                    if prod == 'income':
+                    if prod == 'revenue':
                         data[:, i + 1] = save_dict[mkt]['EN'] + \
                                          save_dict[mkt]['RGU'] + \
                                          save_dict[mkt]['RGD'] + \
@@ -240,15 +301,15 @@ class RevenuePlotter:
         return stat_dict
 
     def calc_summary_stats(self, low=16, high=84):
-        """ Computes median and low/high bounds for each of income, deg, and net """
-        self.ps_stats = {'income':{}, 'degradation':{}, 'net':{}}
+        """ Computes median and low/high bounds for each of revenue, deg, and net """
+        self.ps_stats = {'revenue':{}, 'degradation':{}, 'net':{}}
         for key in self.ps_stats.keys():
             if key == 'net':
-                cols = self.ps['income'].columns
+                cols = self.ps['revenue'].columns
                 for col in cols:
                     if col == 'time':
                         continue
-                    values = self.ps['income'][col].values + self.ps['degradation'][col].values
+                    values = self.ps['revenue'][col].values + self.ps['degradation'][col].values
                     stat_dict = self.get_median_err(values, low, high)
                     self.ps_stats[key][col] = stat_dict
             else:
@@ -267,16 +328,20 @@ class RevenuePlotter:
         self.ps = pd.read_excel('daily_profit_summary.xlsx', sheet_name=None)
         self.calc_summary_stats()
 
-    def add_stat_text(self, ax, mode, labels, incl_errs=False):
+    def add_stat_text(self, ax, mode, labels, incl_errs=False, pos='top'):
         """ Adds the stat summaries to the plot """
+        assert pos in ['top', 'bottom']
         xvals = ax.get_xticks()
         ylims = ax.get_ylim()
-        yval = ylims[0] + 0.1*(ylims[1] - ylims[0])
+        if pos == 'bottom':
+            yval = ylims[0] + 0.1*(ylims[1] - ylims[0])
+        elif pos == 'top':
+            yval = ylims[1] - 0.05*(ylims[1] - ylims[0])
         for i, xval in enumerate(xvals):
-            # Load the relevant stat dict (e.g., mode = 'income', labels[i] = 'baseline')
+            # Load the relevant stat dict (e.g., mode = 'revenue', labels[i] = 'baseline')
             stat_dict = self.ps_stats[mode][labels[i]]
             if incl_errs:
-                stat_text = f'{stat_dict["median"]}k$^{{{stat_dict["high_err"]}}}_{{-{stat_dict["low_err"]}}}$'
+                stat_text = f'${stat_dict["median"]}k$^{{{stat_dict["high_err"]}}}_{{-{stat_dict["low_err"]}}}$'
             else:
                 stat_text = f'${stat_dict["median"]}k'
             ax.text(xval, yval, stat_text, ha='center', va='center', fontsize=12)
@@ -296,13 +361,18 @@ class RevenuePlotter:
         for patch, color, in zip(bplot['boxes'], sns.color_palette('hls', len(labels))):
             patch.set_facecolor(color)
         ax.set_ylabel('Dollars ($)', fontsize=14)
+        if mode != 'degradation':
+            plt.ylim(-2000, 100)
         if self.scale == 1000:
             # Add 'k' to the tick label (thousands of dollars)
             yticklabels = ax.get_yticklabels()
             for ytick in yticklabels:
                 ytick.set_text(f'{ytick.get_text()}k')
             ax.set_yticklabels(yticklabels)
-        self.add_stat_text(ax, mode, labels)
+        pos = 'bottom'
+        if mode == 'net':
+            pos = 'top'
+        self.add_stat_text(ax, mode, labels, pos=pos)
         os.makedirs('figs', exist_ok=True)
         plt.savefig(f'figs/profit_{mode}.png', bbox_inches='tight')
         if show:
@@ -311,12 +381,12 @@ class RevenuePlotter:
         plt.close(fig)
 
     def plot_profits(self, show=False):
-        """ Plots profit summary for income, degradation, and sum """
-        modes = ['income', 'degradation', 'net']
+        """ Plots profit summary for revenue, degradation, and sum """
+        modes = ['revenue', 'degradation', 'net']
         for mode in modes:
             if mode == 'net':
-                net_revenue = self.ps['income']
-                # Add degradation to income, skipping 1st column (times)
+                net_revenue = self.ps['revenue']
+                # Add degradation to revenue, skipping 1st column (times)
                 net_revenue.iloc[:,1:] += self.ps['degradation'].iloc[:,1:]
                 self.make_boxplot(net_revenue, mode, show=show)
             else:
