@@ -258,9 +258,16 @@ class RevenuePlotter:
             product_profits[key] = dict()
             for product in self.products:
                 for pid in pids:
-                    path = os.path.join(directory,f'profit_{pid}.csv')
-                    df = pd.read_csv(path, index_col='time')
-                    df.index = pd.to_datetime(df.index)
+                    try: #Try/except captures both new and legacy naming convention
+                        path = os.path.join(directory,f'profit_{pid}_total.csv')
+                        df = pd.read_csv(path, index_col='time')
+                    except FileNotFoundError:
+                        path = os.path.join(directory, f'profit_{pid}.csv')
+                        df = pd.read_csv(path, index_col='time')
+                    if 'dccommit' in directory:
+                        df.index = pd.to_datetime(df.index, format='%m/%d/%y %H:%M')
+                    else:
+                        df.index = pd.to_datetime(df.index)
                     df = df.resample(self.si).sum()
                     # Save times (just once)
                     if times is None:
@@ -274,10 +281,12 @@ class RevenuePlotter:
                         raise KeyError(f"Product {product} not found in column headers {cols}")
                     prod_vals = df[cols[cidx]].values
                     # Adjust lengths - drop last day for non-deg, drop 1st day for deg
-                    if product == 'DEG':
-                        prod_vals = prod_vals[1:]
-                    else:
-                        prod_vals = prod_vals[:-1]
+                    if 'dccommit' not in directory: # Latest update to scheduler does not include extra DAM
+                        if product == 'DEG':
+                            prod_vals = prod_vals[1:]
+                        else:
+                            prod_vals = prod_vals[:-1]
+                    print(f"For directory {os.path.basename(directory)} found {len(prod_vals)} {product}")
                     if product in product_profits[key].keys():
                         product_profits[key][product] += prod_vals
                     else:
@@ -361,8 +370,10 @@ class RevenuePlotter:
         for patch, color, in zip(bplot['boxes'], sns.color_palette('hls', len(labels))):
             patch.set_facecolor(color)
         ax.set_ylabel('Dollars ($)', fontsize=14)
-        if mode != 'degradation':
-            plt.ylim(-2000, 100)
+        if mode == 'revenue':
+            plt.ylim(-250, 150)
+        elif mode == 'net':
+            plt.ylim(-800, 0)
         if self.scale == 1000:
             # Add 'k' to the tick label (thousands of dollars)
             yticklabels = ax.get_yticklabels()
